@@ -49,7 +49,7 @@
 #endif
 
 #if __WORDSIZE == 64
-#  define TLSF_MAX_SHIFT 36 // 64G
+#  define TLSF_MAX_SHIFT 39 // 512G
 #elif __WORDSIZE == 32
 #  define TLSF_MAX_SHIFT 29 // 512M
 #else

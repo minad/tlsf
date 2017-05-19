@@ -38,11 +38,11 @@
 */
 #define FL_INDEX_MAX (TLSF_MAX_SHIFT + 1)
 
-#define SL_INDEX_COUNT (1U << SL_INDEX_COUNT_SHIFT)
+#define SL_INDEX_COUNT (1UL << SL_INDEX_COUNT_SHIFT)
 #define FL_INDEX_SHIFT (SL_INDEX_COUNT_SHIFT + ALIGN_SIZE_SHIFT)
 #define FL_INDEX_COUNT (FL_INDEX_MAX - FL_INDEX_SHIFT + 1)
 
-#define SMALL_BLOCK_SIZE (1U << FL_INDEX_SHIFT)
+#define SMALL_BLOCK_SIZE (1UL << FL_INDEX_SHIFT)
 
 /*
  * Since block sizes are always at least a multiple of 4, the two least
@@ -95,10 +95,6 @@ _Static_assert(sizeof(size_t) == 4 || sizeof (size_t) == 8, "size_t must be 32 o
 _Static_assert(sizeof(unsigned int) * 8 >= SL_INDEX_COUNT, "SL_INDEX_COUNT must be <= number of bits in sl_bitmap's storage type.");
 _Static_assert(ALIGN_SIZE == SMALL_BLOCK_SIZE / SL_INDEX_COUNT, "Sizes are not properly set");
 _Static_assert(BLOCK_SIZE_MAX == TLSF_MAX_SIZE + BLOCK_OVERHEAD, "Max allocation size is wrong");
-
-// We have to use size_t bitmaps if we want to support larger blocks.
-_Static_assert(FL_INDEX_COUNT <= 32, "Index too large");
-_Static_assert(SL_INDEX_COUNT <= 32, "Index too large");
 
 /*
  * Data structures and associated constants.
@@ -158,7 +154,7 @@ struct tlsf_s {
  */
 
 static inline unsigned int ffs(size_t x) {
-  unsigned int i = (unsigned int)__builtin_ffs((int)x);
+  unsigned int i = (unsigned int)__builtin_ffsl((long)x);
   ASSERT(i, "No set bit found");
   return i - 1U;
 }
@@ -272,8 +268,8 @@ static inline size_t round_block_size(size_t size) {
  * the documentation found in the white paper.
 */
 
-static inline void mapping_insert(size_t size, unsigned int *fli, unsigned int *sli) {
-  unsigned int fl, sl;
+static inline void mapping_insert(size_t size, size_t* fli, size_t* sli) {
+  size_t fl, sl;
   if (size < SMALL_BLOCK_SIZE) {
     // Store small blocks in first list.
     fl = 0;
@@ -290,8 +286,8 @@ static inline void mapping_insert(size_t size, unsigned int *fli, unsigned int *
   *sli = sl;
 }
 
-static block_t search_suitable_block(tlsf_t t, unsigned int *fli, unsigned int *sli) {
-  unsigned int fl = *fli, sl = *sli;
+static block_t search_suitable_block(tlsf_t t, size_t* fli, size_t* sli) {
+  size_t fl = *fli, sl = *sli;
   ASSERT(fl < FL_INDEX_COUNT, "Wrong fl index count");
   ASSERT(sl < SL_INDEX_COUNT, "Wrong sl index count");
 
@@ -322,7 +318,7 @@ static block_t search_suitable_block(tlsf_t t, unsigned int *fli, unsigned int *
 }
 
 // Remove a free block from the free list.
-static void remove_free_block(tlsf_t t, block_t block, unsigned int fl, unsigned int sl) {
+static void remove_free_block(tlsf_t t, block_t block, size_t fl, size_t sl) {
   ASSERT(fl < FL_INDEX_COUNT, "Wrong fl index count");
   ASSERT(sl < SL_INDEX_COUNT, "Wrong sl index count");
 
@@ -339,11 +335,11 @@ static void remove_free_block(tlsf_t t, block_t block, unsigned int fl, unsigned
 
     // If the new head is null, clear the bitmap.
     if (next == &t->block_null) {
-      t->sl_bitmap[fl] &= ~(1U << sl);
+      t->sl_bitmap[fl] &= ~(1UL << sl);
 
       // If the second bitmap is now empty, clear the fl bitmap.
       if (!t->sl_bitmap[fl])
-        t->fl_bitmap &= ~(1U << fl);
+        t->fl_bitmap &= ~(1UL << fl);
     }
   }
 
@@ -355,7 +351,7 @@ static void remove_free_block(tlsf_t t, block_t block, unsigned int fl, unsigned
 }
 
 // Insert a free block into the free block list.
-static void insert_free_block(tlsf_t t, block_t block, unsigned int fl, unsigned int sl) {
+static void insert_free_block(tlsf_t t, block_t block, size_t fl, size_t sl) {
   block_t current = t->blocks[fl][sl];
   ASSERT(current, "free list cannot have a null entry");
   ASSERT(block, "cannot insert a null entry into the free list");
@@ -369,8 +365,8 @@ static void insert_free_block(tlsf_t t, block_t block, unsigned int fl, unsigned
    * and second-level bitmaps appropriately.
   */
   t->blocks[fl][sl] = block;
-  t->fl_bitmap |= (1U << fl);
-  t->sl_bitmap[fl] |= (1U << sl);
+  t->fl_bitmap |= (1UL << fl);
+  t->sl_bitmap[fl] |= (1UL << sl);
 
 #ifdef TLSF_STATS
   ASSERT(t->stats.used_size >= block_size(block), "wrong used");
@@ -381,14 +377,14 @@ static void insert_free_block(tlsf_t t, block_t block, unsigned int fl, unsigned
 
 // Remove a given block from the free list.
 static void block_remove(tlsf_t t, block_t block) {
-  unsigned int fl, sl;
+  size_t fl, sl;
   mapping_insert(block_size(block), &fl, &sl);
   remove_free_block(t, block, fl, sl);
 }
 
 // Insert a given block into the free list.
 static void block_insert(tlsf_t t, block_t block) {
-  unsigned int fl, sl;
+  size_t fl, sl;
   mapping_insert(block_size(block), &fl, &sl);
   insert_free_block(t, block, fl, sl);
 }
@@ -474,7 +470,7 @@ static void block_trim_used(tlsf_t t, block_t block, size_t size) {
 
 // Locate a free block with an appropriate size.
 static block_t block_locate_free(tlsf_t t, size_t size) {
-  unsigned int fl = 0, sl = 0;
+  size_t fl = 0, sl = 0;
   mapping_insert(round_block_size(size), &fl, &sl);
 
   block_t block = search_suitable_block(t, &fl, &sl);
@@ -745,7 +741,7 @@ void tlsf_check(tlsf_t t) {
       INSIST(block != &t->block_null, "block should not be null");
 
       while (block != &t->block_null) {
-        unsigned int fli, sli;
+        size_t fli, sli;
         INSIST(block_is_free(block), "block should be free");
         INSIST(!block_is_prev_free(block), "blocks should have coalesced");
         INSIST(!block_is_free(block_next(block)), "blocks should have coalesced");
