@@ -25,7 +25,7 @@
 #ifdef TLSF_64BIT
 #define ALIGN_SIZE_SHIFT 3
 #else
-#define ALIGN_SIZE_SHIFT 3
+#define ALIGN_SIZE_SHIFT 2
 #endif
 
 #define ALIGN_SIZE (1UL << ALIGN_SIZE_SHIFT)
@@ -47,7 +47,7 @@
 #ifdef TLSF_64BIT
 #define FL_INDEX_MAX 33 // 8G
 #else
-#define FL_INDEX_MAX 30 // 2G
+#define FL_INDEX_MAX 29 // 1G
 #endif
 
 #define SL_INDEX_COUNT (1U << SL_INDEX_COUNT_SHIFT)
@@ -55,17 +55,6 @@
 #define FL_INDEX_COUNT (FL_INDEX_MAX - FL_INDEX_SHIFT + 1)
 
 #define SMALL_BLOCK_SIZE (1U << FL_INDEX_SHIFT)
-
-/*
- * Since block sizes are always at least a multiple of 4, the two least
- * significant bits of the size field are used to store the block status:
- * - bit 0: whether block is busy or free
- * - bit 1: whether previous block is busy or free
-*/
-#define BLOCK_FREE_BIT      1U
-#define BLOCK_PREV_FREE_BIT 2U
-#define BLOCK_POOL_BIT      4U
-#define BLOCK_BITMASK       (BLOCK_POOL_BIT | BLOCK_FREE_BIT | BLOCK_PREV_FREE_BIT)
 
 /*
  * The size of the block header exposed to used blocks is the size field.
@@ -133,8 +122,16 @@ typedef struct block_s {
   // Points to the previous physical block.
   struct block_s* prev_phys_block;
 
-  // The size of this block excluding the block header and bits.
-  size_t header;
+  // The size of this block and header bits
+  union {
+    size_t header;
+    struct {
+      size_t size         : __WORDSIZE - 3;
+      bool   is_free      : 1;
+      bool   is_prev_free : 1;
+      bool   is_pool      : 1;
+    };
+  };
 
   // Next and previous free blocks.
   struct block_s* next_free;
@@ -186,35 +183,8 @@ static inline unsigned int flsl(size_t x) {
  * block_t member functions.
 */
 
-static inline size_t block_size(const block_t block) {
-  return block->header & ~BLOCK_BITMASK;
-}
-
-static inline void block_set_size(block_t block, size_t size) {
-  const size_t oldsize = block->header;
-  block->header = size | (oldsize & BLOCK_BITMASK);
-}
-
 static inline bool block_is_last(const block_t block) {
-  return block_size(block) == 0;
-}
-
-static inline bool block_is_free(const block_t block) {
-  return !!(block->header & BLOCK_FREE_BIT);
-}
-
-static inline bool block_is_prev_free(const block_t block) {
-  return !!(block->header & BLOCK_PREV_FREE_BIT);
-}
-
-static inline void block_set_prev_free(block_t block, bool free) {
-  if (free) {
-    //ASSERT(!block_is_prev_free(block), "Previous block is already free");
-    block->header |= BLOCK_PREV_FREE_BIT;
-  } else {
-    //ASSERT(block_is_prev_free(block), "Previous block is already used");
-    block->header &= ~BLOCK_PREV_FREE_BIT;
-  }
+  return block->size == 0;
 }
 
 static inline block_t block_from_ptr(void* ptr) {
@@ -227,13 +197,13 @@ static inline void* block_to_ptr(const block_t block) {
 
 // Return location of previous block.
 static inline block_t block_prev(const block_t block) {
-  ASSERT(block_is_prev_free(block), "previous block must be free");
+  ASSERT(block->is_prev_free, "previous block must be free");
   return block->prev_phys_block;
 }
 
 // Return location of next existing block.
 static inline block_t block_next(const block_t block) {
-  block_t next = OFFSET_TO_BLOCK(block_to_ptr(block), block_size(block) - BLOCK_OVERHEAD);
+  block_t next = OFFSET_TO_BLOCK(block_to_ptr(block), block->size - BLOCK_OVERHEAD);
   ASSERT(!block_is_last(block), "Block is last");
   return next;
 }
@@ -246,18 +216,13 @@ static inline block_t block_link_next(block_t block) {
 }
 
 static inline bool block_can_split(block_t block, size_t size) {
-  return block_size(block) >= sizeof (struct block_s) + size;
+  return block->size >= sizeof (struct block_s) + size;
 }
 
 static inline void block_set_free(block_t block, bool free) {
-  if (free) {
-    ASSERT(!block_is_free(block), "Block is already free");
-    block->header |= BLOCK_FREE_BIT;
-  } else {
-    ASSERT(block_is_free(block), "Block is already used");
-    block->header &= ~BLOCK_FREE_BIT;
-  }
-  block_set_prev_free(block_link_next(block), free);
+  ASSERT(free ? !block->is_free : block->is_free, "Block is already free/used");
+  block->is_free = free;
+  block_link_next(block)->is_prev_free = free;
 }
 
 static inline size_t align_up(size_t x) {
@@ -360,9 +325,9 @@ static void remove_free_block(tlsf_t t, block_t block, unsigned int fl, unsigned
   }
 
 #ifdef TLSF_STATS
-  ASSERT(t->stats.free_size >= block_size(block), "wrong free");
-  t->stats.free_size -= block_size(block);
-  t->stats.used_size += block_size(block);
+  ASSERT(t->stats.free_size >= block->size, "wrong free");
+  t->stats.free_size -= block->size;
+  t->stats.used_size += block->size;
 #endif
 }
 
@@ -385,23 +350,23 @@ static void insert_free_block(tlsf_t t, block_t block, unsigned int fl, unsigned
   t->sl_bitmap[fl] |= (1U << sl);
 
 #ifdef TLSF_STATS
-  ASSERT(t->stats.used_size >= block_size(block), "wrong used");
-  t->stats.free_size += block_size(block);
-  t->stats.used_size -= block_size(block);
+  ASSERT(t->stats.used_size >= block->size, "wrong used");
+  t->stats.free_size += block->size;
+  t->stats.used_size -= block->size;
 #endif
 }
 
 // Remove a given block from the free list.
 static void block_remove(tlsf_t t, block_t block) {
   unsigned int fl, sl;
-  mapping_insert(block_size(block), &fl, &sl);
+  mapping_insert(block->size, &fl, &sl);
   remove_free_block(t, block, fl, sl);
 }
 
 // Insert a given block into the free list.
 static void block_insert(tlsf_t t, block_t block) {
   unsigned int fl, sl;
-  mapping_insert(block_size(block), &fl, &sl);
+  mapping_insert(block->size, &fl, &sl);
   insert_free_block(t, block, fl, sl);
 }
 
@@ -410,16 +375,19 @@ static block_t block_split(block_t block, size_t size) {
   // Calculate the amount of space left in the remaining block.
   block_t remaining = OFFSET_TO_BLOCK(block_to_ptr(block), size - BLOCK_OVERHEAD);
 
-  const size_t remain_size = block_size(block) - (size + BLOCK_OVERHEAD);
+  const size_t remain_size = block->size - (size + BLOCK_OVERHEAD);
 
   ASSERT(block_to_ptr(remaining) == align_ptr(block_to_ptr(remaining)), "remaining block not aligned properly");
-  ASSERT(block_size(block) == remain_size + size + BLOCK_OVERHEAD, "remaining block size is wrong");
+  ASSERT(block->size == remain_size + size + BLOCK_OVERHEAD, "remaining block size is wrong");
   ASSERT(remain_size >= BLOCK_SIZE_MIN, "block split with invalid size");
 
-  remaining->header = remain_size;
+  remaining->size = remain_size;
+  remaining->is_pool = false;
+  remaining->is_free = false;
+  remaining->is_prev_free = false;
 
   block_set_free(remaining, true);
-  block_set_size(block, size);
+  block->size = size;
 
   return remaining;
 }
@@ -427,18 +395,17 @@ static block_t block_split(block_t block, size_t size) {
 // Absorb a free block's storage into an adjacent previous free block.
 static block_t block_absorb(block_t prev, block_t block) {
   ASSERT(!block_is_last(prev), "previous block can't be last");
-  // Note: Leaves flags untouched.
-  prev->header += block_size(block) + BLOCK_OVERHEAD;
+  prev->size += block->size + BLOCK_OVERHEAD;
   block_link_next(prev);
   return prev;
 }
 
 // Merge a just-freed block with an adjacent previous free block.
 static block_t block_merge_prev(tlsf_t t, block_t block) {
-  if (block_is_prev_free(block)) {
+  if (block->is_prev_free) {
     block_t prev = block_prev(block);
     ASSERT(prev, "prev physical block can't be null");
-    ASSERT(block_is_free(prev), "prev block is not free though marked as such");
+    ASSERT(prev->is_free, "prev block is not free though marked as such");
     block_remove(t, prev);
     block = block_absorb(prev, block);
   }
@@ -451,7 +418,7 @@ static block_t block_merge_next(tlsf_t t, block_t block) {
   block_t next = block_next(block);
   ASSERT(next, "next physical block can't be null");
 
-  if (block_is_free(next)) {
+  if (next->is_free) {
     ASSERT(!block_is_last(block), "previous block can't be last");
     block_remove(t, next);
     block = block_absorb(block, next);
@@ -462,25 +429,25 @@ static block_t block_merge_next(tlsf_t t, block_t block) {
 
 // Trim any trailing block space off the end of a block, return to pool.
 static void block_trim_free(tlsf_t t, block_t block, size_t size) {
-  ASSERT(block_is_free(block), "block must be free");
+  ASSERT(block->is_free, "block must be free");
   if (block_can_split(block, size)) {
-    block_t remaining_block = block_split(block, size);
+    block_t remaining = block_split(block, size);
     block_link_next(block);
-    block_set_prev_free(remaining_block, true);
-    block_insert(t, remaining_block);
+    remaining->is_prev_free = true;
+    block_insert(t, remaining);
   }
 }
 
 // Trim any trailing block space off the end of a used block, return to pool.
 static void block_trim_used(tlsf_t t, block_t block, size_t size) {
-  ASSERT(!block_is_free(block), "block must be used");
+  ASSERT(!block->is_free, "block must be used");
   if (block_can_split(block, size)) {
     // If the next block is free, we must coalesce.
-    block_t remaining_block = block_split(block, size);
-    block_set_prev_free(remaining_block, false);
+    block_t remaining = block_split(block, size);
+    remaining->is_prev_free = false;
 
-    remaining_block = block_merge_next(t, remaining_block);
-    block_insert(t, remaining_block);
+    remaining = block_merge_next(t, remaining);
+    block_insert(t, remaining);
   }
 }
 
@@ -490,7 +457,7 @@ static block_t block_locate_free(tlsf_t t, size_t size) {
   mapping_search(size, &fl, &sl);
   block_t block = search_suitable_block(t, &fl, &sl);
   if (block) {
-    ASSERT(block_size(block) >= size, "insufficient block size");
+    ASSERT(block->size >= size, "insufficient block size");
     remove_free_block(t, block, fl, sl);
   }
   return block;
@@ -520,17 +487,24 @@ static block_t add_pool(tlsf_t t, void* mem, size_t size) {
    * it will never be used.
    */
   block_t block = OFFSET_TO_BLOCK(mem, -BLOCK_OVERHEAD);
-  block->header = pool_size | BLOCK_FREE_BIT;
+  block->size = pool_size;
+  block->is_free = true;
+  block->is_prev_free = false;
+  block->is_pool = false;
   block_insert(t, block);
 
   // Split the block to create a zero-size sentinel block.
-  block_link_next(block)->header = BLOCK_PREV_FREE_BIT;
+  block_t sentinel = block_link_next(block);
+  sentinel->size = 0;
+  sentinel->is_free = false;
+  sentinel->is_prev_free = true;
+  sentinel->is_pool = false;
 
   return block;
 }
 
 static void remove_pool(tlsf_t t, block_t block) {
-  size_t size = block_size(block);
+  size_t size = block->size;
 
 #ifdef TLSF_STATS
   ASSERT(t->stats.used_size >= size, "wrong used");
@@ -541,8 +515,8 @@ static void remove_pool(tlsf_t t, block_t block) {
   --t->stats.pool_count;
 #endif
 
-  ASSERT(block_size(block_next(block)) == 0, "sentinel should have size 0");
-  ASSERT(!block_is_free(block_next(block)), "sentinel block should not be free");
+  ASSERT(block_next(block)->size == 0, "sentinel should have size 0");
+  ASSERT(!block_next(block)->is_free, "sentinel block should not be free");
   t->unmap((char*)block + BLOCK_OVERHEAD, size + POOL_OVERHEAD, t->user);
 }
 
@@ -591,9 +565,9 @@ void tlsf_destroy(tlsf_t t) {
 
   if (t->unmap) {
     block_t first_block = OFFSET_TO_BLOCK(t, TLSF_SIZE  - BLOCK_OVERHEAD);
-    ASSERT(block_size(block_next(first_block)) == 0, "sentinel should have size 0");
-    ASSERT(!block_is_free(block_next(first_block)), "sentinel block should not be free");
-    t->unmap(t, TLSF_SIZE + block_size(first_block) + POOL_OVERHEAD, t->user);
+    ASSERT(block_next(first_block)->size == 0, "sentinel should have size 0");
+    ASSERT(!block_next(first_block)->is_free, "sentinel block should not be free");
+    t->unmap(t, TLSF_SIZE + first_block->size + POOL_OVERHEAD, t->user);
   }
 }
 
@@ -608,7 +582,7 @@ void* tlsf_malloc(tlsf_t t, size_t size) {
     if (!mem)
       return 0;
     ASSERT(memsize >= minsize, "not enough memory allocated");
-    add_pool(t, (char*)mem, memsize)->header |= BLOCK_POOL_BIT;
+    add_pool(t, (char*)mem, memsize)->is_pool = true;
     block = block_locate_free(t, size);
   }
   ASSERT(block, "No block found");
@@ -627,7 +601,7 @@ void tlsf_free(tlsf_t t, void* mem) {
     return;
 
   block_t block = block_from_ptr(mem);
-  ASSERT(!block_is_free(block), "block already marked as free");
+  ASSERT(!block->is_free, "block already marked as free");
 
 #ifdef TLSF_STATS
   ++t->stats.free_count;
@@ -637,7 +611,7 @@ void tlsf_free(tlsf_t t, void* mem) {
   block = block_merge_prev(t, block);
   block = block_merge_next(t, block);
 
-  if ((block->header & BLOCK_POOL_BIT) && block_size(block_next(block)) == 0 && t->unmap)
+  if (block->is_pool && block_next(block)->size == 0 && t->unmap)
     remove_pool(t, block);
   else
     block_insert(t, block);
@@ -670,17 +644,17 @@ void* tlsf_realloc(tlsf_t t, void* mem, size_t size) {
   block_t block = block_from_ptr(mem);
   block_t next = block_next(block);
 
-  const size_t cursize = block_size(block);
-  const size_t combined = cursize + block_size(next) + BLOCK_OVERHEAD;
+  const size_t cursize = block->size;
+  const size_t combined = cursize + next->size + BLOCK_OVERHEAD;
   size = adjust_size(size);
 
-  ASSERT(!block_is_free(block), "block already marked as free");
+  ASSERT(!block->is_free, "block already marked as free");
 
   /*
    * If the next block is used, or when combined with the current
    * block, does not offer enough space, we must reallocate and copy.
    */
-  if (size > cursize && (!block_is_free(next) || size > combined)) {
+  if (size > cursize && (!next->is_free || size > combined)) {
     void* p = tlsf_malloc(t, size);
     if (p) {
       memcpy(p, mem, cursize);
@@ -692,7 +666,7 @@ void* tlsf_realloc(tlsf_t t, void* mem, size_t size) {
   // Do we need to expand to the next block?
   if (size > cursize) {
     block_merge_next(t, block);
-    block_set_prev_free(block_next(block), false);
+    block_next(block)->is_prev_free = false;
   }
 
   // Trim the resulting block and return the original pointer.
@@ -747,13 +721,13 @@ void tlsf_check(tlsf_t t) {
 
       while (block != &t->block_null) {
         unsigned int fli, sli;
-        INSIST(block_is_free(block), "block should be free");
-        INSIST(!block_is_prev_free(block), "blocks should have coalesced");
-        INSIST(!block_is_free(block_next(block)), "blocks should have coalesced");
-        INSIST(block_is_prev_free(block_next(block)), "block should be free");
-        INSIST(block_size(block) >= BLOCK_SIZE_MIN, "block not minimum size");
+        INSIST(block->is_free, "block should be free");
+        INSIST(!block->is_prev_free, "blocks should have coalesced");
+        INSIST(!block_next(block)->is_free, "blocks should have coalesced");
+        INSIST(block_next(block)->is_prev_free, "block should be free");
+        INSIST(block->size >= BLOCK_SIZE_MIN, "block not minimum size");
 
-        mapping_insert(block_size(block), &fli, &sli);
+        mapping_insert(block->size, &fli, &sli);
         INSIST(fli == i && sli == j, "block size indexed in wrong list");
         block = block->next_free;
       }
